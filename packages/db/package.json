@@ -1,0 +1,10 @@
+{
+  "name": "@call-lagao/db",
+  "version": "0.1.0",
+  "license": "AGPL-3.0-only",
+  "private": true,
+  "description": "SQL migrations for Call Lagao (applied in filename order by apps/api)",
+  "files": [
+    "migrations"
+  ]
+}
