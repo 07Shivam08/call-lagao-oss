@@ -82,6 +82,8 @@ export const CallStartedReport = z.object({
 /** Worker → API: POST /internal/calls/:id/ended */
 export const CallEndedReport = z.object({
   ended_at: z.number(), // epoch ms
+  /** When the caller joined/answered (epoch ms). Lets the API recover if the `started` report was lost. */
+  started_at: z.number().optional(),
   disconnection_reason: z.enum(DISCONNECTION_REASONS),
   transcript: z.array(TranscriptItem).default([]),
   collected_variables: z.record(z.string(), z.string()).default({}),

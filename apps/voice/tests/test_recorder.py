@@ -117,3 +117,10 @@ def test_times_before_start_clamp_to_zero():
     rec.mark_started(T0)
     rec.add_agent("early", start=T0 - 5)
     assert rec.transcript()[0].start_ms == 0.0
+
+
+def test_report_carries_started_at_only_after_answer():
+    rec = CallRecorder()
+    assert "started_at" not in rec.build_report("user_hangup").to_payload()
+    rec.mark_started(1_700_000_000.25)
+    assert rec.build_report("user_hangup").to_payload()["started_at"] == 1_700_000_000_250

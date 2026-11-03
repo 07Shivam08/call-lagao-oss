@@ -27,6 +27,8 @@ export type Env = {
   allowPrivateUrls: boolean;
   livekit: { url: string; apiKey: string; apiSecret: string; agentName: string; sipOutboundTrunkId: string };
   openaiApiKey: string;
+  /** Caller IDs (E.164) that outbound phone calls may use. Empty = phone calls disabled. */
+  sipFromNumbers: string[];
 };
 
 export function readEnv(): Env {
@@ -49,6 +51,7 @@ export function readEnv(): Env {
       sipOutboundTrunkId: str("LIVEKIT_SIP_OUTBOUND_TRUNK_ID"),
     },
     openaiApiKey: str("OPENAI_API_KEY"),
+    sipFromNumbers: str("SIP_FROM_NUMBERS").split(",").map((n) => n.trim()).filter(Boolean),
   };
 }
 

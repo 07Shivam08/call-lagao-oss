@@ -90,6 +90,11 @@ export function accountRoutes(app: FastifyInstance, d: Deps) {
     return toOrg(org!);
   });
 
+  app.get("/v1/org/webhook-secret", async (req) => {
+    const [org] = await db.query(`select webhook_secret from organizations where id = $1`, [req.auth!.orgId]);
+    return { webhook_secret: org!.webhook_secret as string };
+  });
+
   app.post("/v1/org/webhook-secret", async (req) => {
     const secret = `whsec_${randomToken(24)}`;
     await db.query(`update organizations set webhook_secret = $2 where id = $1`, [req.auth!.orgId, secret]);

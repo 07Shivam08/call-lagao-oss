@@ -56,6 +56,8 @@ class CallRecorder:
         # Epoch seconds that "ms since call start" is measured from. Set by
         # mark_started(); until then the recorder creation time is used.
         self.start_time: float = time.time()
+        # Epoch ms when the call was answered (None until mark_started()).
+        self.started_at_ms: int | None = None
         self._entries: list[_Entry] = []
         self._seq = itertools.count()
         self._tool_ids: set[str] = set()
@@ -69,6 +71,7 @@ class CallRecorder:
 
     def mark_started(self, at: float | None = None) -> None:
         self.start_time = at if at is not None else time.time()
+        self.started_at_ms = int(self.start_time * 1000)
 
     def rel_ms(self, ts: float | None = None) -> float:
         """Epoch seconds -> ms since call start (never negative)."""
@@ -235,6 +238,7 @@ class CallRecorder:
     ) -> CallEndedReport:
         return CallEndedReport(
             ended_at=ended_at_ms if ended_at_ms is not None else int(time.time() * 1000),
+            started_at=self.started_at_ms,
             disconnection_reason=reason,
             transcript=self.transcript(),
             collected_variables=dict(self.collected_variables),

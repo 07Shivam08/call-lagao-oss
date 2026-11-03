@@ -40,7 +40,8 @@ Errors return `{ "error": { "code": string, "message": string } }` with a proper
 | POST | `/v1/auth/logout` | → `{ok:true}` (clears cookie) |
 | GET | `/v1/session` | → `{user:{user_id,email,name}, org:{org_id,name,webhook_url,concurrency_limit}}` |
 | PATCH | `/v1/org` | `{name?, webhook_url?: string\|null}` → org |
-| POST | `/v1/org/webhook-secret` | → `{webhook_secret}` (rotates; shown once) |
+| GET | `/v1/org/webhook-secret` | → `{webhook_secret}` (the current signing secret) |
+| POST | `/v1/org/webhook-secret` | → `{webhook_secret}` (rotates; the old secret stops working immediately) |
 | GET | `/v1/api-keys` | → `{items:[{key_id,name,key_prefix,created_timestamp,last_used_timestamp}]}` |
 | POST | `/v1/api-keys` | `{name}` → `{key_id, name, api_key}` (**plaintext shown once**, stored hashed) |
 | DELETE | `/v1/api-keys/:key_id` | → `{ok:true}` |
@@ -68,10 +69,10 @@ type Agent = { agent_id; name; version; base_version: number|null; is_published;
 | Method | Path | Body → Response |
 |---|---|---|
 | POST | `/v1/calls/web` | `{agent_id, agent_version?, dynamic_variables?: Record<string,string>, metadata?}` → `{call_id, access_token, livekit_url, call: Call}`. Uses the published version by default, or the draft if nothing is published yet. |
-| POST | `/v1/calls/phone` | `{agent_id, agent_version?, from_number, to_number, dynamic_variables?, metadata?}` → `{call_id, call}`. Needs `LIVEKIT_SIP_OUTBOUND_TRUNK_ID`, else `501 not_configured`. |
+| POST | `/v1/calls/phone` | `{agent_id, agent_version?, from_number?, to_number, dynamic_variables?, metadata?}` → `{call_id, call}`. Needs `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` and `SIP_FROM_NUMBERS`, else `501 not_configured`. `from_number` must be one of `SIP_FROM_NUMBERS` (`400 from_number_not_allowed`) and defaults to the first. |
 | GET | `/v1/calls` | `?limit=50&pagination_key=&agent_id=&status=` → `{items: Call[], has_more, pagination_key}`, newest first |
 | GET | `/v1/calls/:call_id` | → `Call` |
-| POST | `/v1/calls/:call_id/stop` | → `{ok:true}` (deletes the LiveKit room; the worker then reports `manual_stopped`) |
+| POST | `/v1/calls/:call_id/stop` | → `{ok:true}`. Deletes the LiveKit room; the worker then reports `manual_stopped`. If no report arrives within 15 s (the worker died), the API closes the call itself. |
 
 ### Meta
 | GET | `/v1/meta/options` | → `{llm_models: string[], tts_providers: string[], voices: {provider, voice_id, name}[], stt_languages: string[]}` |
@@ -88,11 +89,12 @@ Header `x-internal-secret: $INTERNAL_API_SECRET` is required, or the API returns
 |---|---|---|
 | GET | `/internal/calls/:call_id/context` | → `CallContext` = `{call:{call_id, call_type, direction, agent_id, agent_version, from_number, to_number, metadata}, agent_name, agent_config: AgentConfig, dynamic_variables}` |
 | POST | `/internal/calls/:call_id/started` | `{started_at}` → `{ok:true}`; status → `ongoing`, fires `call_started` |
-| POST | `/internal/calls/:call_id/ended` | `CallEndedReport` → `{ok:true}`; status → `ended` (or `error` for `error_*` reasons). The API then computes latency distributions and cost, runs post-call analysis, and fires `call_ended` then `call_analyzed`. Idempotent: a second `ended` for the same call is ignored. |
+| POST | `/internal/calls/:call_id/ended` | `CallEndedReport` → `{ok:true}`; status → `ended` (or `error` for `error_*` reasons). The API then computes latency distributions and cost, runs post-call analysis, and fires `call_ended` then `call_analyzed`. Idempotent: a second `ended` for the same call is ignored. If the API had already closed the call provisionally (stop grace period or stale-call reaper), the first real report replaces that result and `call_ended` / `call_analyzed` are sent again with the real data. |
 
 ```ts
 CallEndedReport = {
   ended_at: number,
+  started_at?: number,                       // answer time; lets the API recover a lost `started` report
   disconnection_reason: "user_hangup"|"agent_hangup"|"manual_stopped"|"inactivity"|"max_duration_reached"|"dial_failed"|"dial_no_answer"|"dial_busy"|"concurrency_limit_reached"|"error_llm"|"error_stt"|"error_tts"|"error_worker"|"error_unknown",
   transcript: TranscriptItem[],              // see below, in time order
   collected_variables: Record<string,string>,
@@ -127,6 +129,7 @@ TranscriptItem =
 **Worker behaviours worth knowing (livekit-agents 1.8.9):**
 - A `phone_user` counts as answered (`started`) only once its `sip.callStatus` attribute becomes `active`. If it leaves before that, the reason is `dial_busy`, `dial_no_answer` or `dial_failed`.
 - If no caller joins within `CALL_JOIN_TIMEOUT_S` (default 120 s), the worker reports `dial_no_answer`. The API stores calls that never started as `not_connected`.
+- Safety net: calls still `registered` after 3 min become `not_connected`, and calls `ongoing` for more than 3 h become `error` (`error_worker`). Both go through the normal end path, so `call_ended` webhooks fire.
 - Goodbyes on silence or max duration are generated by the LLM (without tools), so they follow the agent's language.
 - Custom tools send `GET` arguments as query params and a JSON body for every other method. Non-public destinations are refused and redirects aren't followed, unless `ALLOW_PRIVATE_URLS=true`.
 

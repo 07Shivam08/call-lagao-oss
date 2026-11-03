@@ -1,10 +1,17 @@
-import { AgentConfig, computeCost, distribution, type CallEndedReport, type Distribution, type LatencySamples } from "@call-lagao/shared";
+import { AgentConfig, CallEndedReport, computeCost, distribution, type Distribution, type LatencySamples } from "@call-lagao/shared";
 import type { Db } from "../db.js";
 import { toCall } from "../serialize.js";
 import type { Analyzer } from "./analysis.js";
 import { sendWebhooks, type WebhookOptions } from "./webhooks.js";
 
 export type LifecycleDeps = { db: Db; analyzer: Analyzer; webhooks: WebhookOptions; background: (p: Promise<unknown>) => void };
+
+export type EndOptions = {
+  /** The API is closing the call itself (no worker report). Such an end is provisional: a later worker report replaces it. */
+  fallback?: boolean;
+  /** Force the resulting status instead of deriving it from the report. */
+  status?: "ended" | "not_connected" | "error";
+};
 
 /** A call that never got a participant within this window is marked not_connected. */
 export const REGISTERED_TIMEOUT_MS = 3 * 60_000;
@@ -43,23 +50,32 @@ export function latencyDistributions(samples: LatencySamples): Partial<Record<ke
   return out;
 }
 
-/** Idempotent: only the first `ended` report for a call is applied. */
-export async function markEnded(deps: LifecycleDeps, callId: string, report: CallEndedReport): Promise<boolean> {
+/**
+ * Idempotent: only the first `ended` report for a call is applied, except that a real worker
+ * report replaces a provisional end the API made itself (`fallback`).
+ */
+export async function markEnded(deps: LifecycleDeps, callId: string, report: CallEndedReport, opts: EndOptions = {}): Promise<boolean> {
   const { db } = deps;
+  const fallback = Boolean(opts.fallback);
   const current = await loadCallWithConfig(db, callId);
-  if (!current || current.status === "ended" || current.status === "error" || current.status === "not_connected") return false;
+  if (!current) return false;
+  const active = current.status === "registered" || current.status === "ongoing";
+  if (!active && !(current.ended_by_fallback && !fallback)) return false;
 
   const cfg = AgentConfig.parse(current.agent_config ?? {});
-  const startedAt = current.started_at ? new Date(current.started_at).getTime() : null;
+  // If the worker's `started` report was lost, its `ended` report still carries the answer time.
+  const startedAt = current.started_at ? new Date(current.started_at).getTime() : (report.started_at ?? null);
   const durationMs = startedAt ? Math.max(0, report.ended_at - startedAt) : 0;
   const neverConnected = !startedAt;
-  const status = report.disconnection_reason.startsWith("error_") ? "error" : neverConnected ? "not_connected" : "ended";
-  const cost = computeCost(durationMs, report.usage, cfg.stt.provider, report.usage.tts_provider ?? cfg.voice.provider, !neverConnected);
+  const status = opts.status ?? (report.disconnection_reason.startsWith("error_") ? "error" : neverConnected ? "not_connected" : "ended");
+  const analyse = !neverConnected && report.transcript.length > 0;
+  const cost = computeCost(durationMs, report.usage, cfg.stt.provider, report.usage.tts_provider ?? cfg.voice.provider, analyse);
 
   const updated = await db.query(
     `update calls set status = $2, disconnection_reason = $3, ended_at = $4, duration_ms = $5, transcript = $6,
-            collected_variables = $7, latency = $8, usage = $9, cost = $10, error_message = $11
-      where id = $1 and status in ('registered', 'ongoing') returning id`,
+            collected_variables = $7, latency = $8, usage = $9, cost = $10, error_message = $11,
+            started_at = coalesce(started_at, $12), ended_by_fallback = $13
+      where id = $1 and (status in ('registered', 'ongoing') or (ended_by_fallback and not $13)) returning id`,
     [
       callId,
       status,
@@ -72,6 +88,8 @@ export async function markEnded(deps: LifecycleDeps, callId: string, report: Cal
       JSON.stringify(report.usage),
       JSON.stringify(cost),
       report.error_message ?? null,
+      startedAt ? new Date(startedAt) : null,
+      fallback,
     ],
   );
   if (!updated.length) return false; // lost a race with another ended report
@@ -86,7 +104,7 @@ async function postCall(deps: LifecycleDeps, callId: string, cfg: AgentConfig) {
   let row = await loadCallWithConfig(db, callId);
   await sendWebhooks(db, row.org_id, "call_ended", toCall(row), cfg.webhook_url, deps.webhooks);
 
-  if (row.status === "not_connected") return;
+  if (row.status === "not_connected" || !toCall(row).transcript.length) return;
   let analysis = null;
   try {
     analysis = await deps.analyzer.analyze(toCall(row).transcript, cfg);
@@ -108,17 +126,25 @@ async function postCall(deps: LifecycleDeps, callId: string, cfg: AgentConfig) {
   await sendWebhooks(db, row.org_id, "call_analyzed", toCall(row), cfg.webhook_url, deps.webhooks);
 }
 
-/** Close out calls that will never get a worker report. Cheap enough to run on each list/create. */
-export async function reapStaleCalls(db: Db, orgId: string) {
-  await db.query(
-    `update calls set status = 'not_connected', disconnection_reason = coalesce(disconnection_reason, 'error_worker'), ended_at = now()
-      where org_id = $1 and status = 'registered' and created_at < now() - ($2 || ' milliseconds')::interval`,
-    [orgId, String(REGISTERED_TIMEOUT_MS)],
+/**
+ * Close out calls that will never get a worker report. Cheap enough to run on each list/create.
+ * Goes through markEnded, so call_ended webhooks fire; a late worker report still replaces the result.
+ */
+export async function reapStaleCalls(deps: LifecycleDeps, orgId: string) {
+  const stale = await deps.db.query(
+    `select id, status from calls
+      where org_id = $1 and ((status = 'registered' and created_at < now() - ($2 || ' milliseconds')::interval)
+                          or (status = 'ongoing' and started_at < now() - ($3 || ' milliseconds')::interval))`,
+    [orgId, String(REGISTERED_TIMEOUT_MS), String(ONGOING_TIMEOUT_MS)],
   );
-  await db.query(
-    `update calls set status = 'error', disconnection_reason = 'error_worker', ended_at = now(),
-            duration_ms = (extract(epoch from (now() - started_at)) * 1000)::int
-      where org_id = $1 and status = 'ongoing' and started_at < now() - ($2 || ' milliseconds')::interval`,
-    [orgId, String(ONGOING_TIMEOUT_MS)],
-  );
+  for (const r of stale) {
+    const report = CallEndedReport.parse({ ended_at: Date.now(), disconnection_reason: "error_worker", error_message: "No report from the voice worker; closed by the API" });
+    await markEnded(deps, r.id, report, { fallback: true, status: r.status === "registered" ? "not_connected" : "error" });
+  }
+}
+
+/** After a manual stop, wait for the worker's report; if none arrives (worker died), close the call ourselves. */
+export async function endAfterStopGrace(deps: LifecycleDeps, callId: string, graceMs: number) {
+  if (graceMs > 0) await new Promise((r) => setTimeout(r, graceMs));
+  await markEnded(deps, callId, CallEndedReport.parse({ ended_at: Date.now(), disconnection_reason: "manual_stopped" }), { fallback: true });
 }

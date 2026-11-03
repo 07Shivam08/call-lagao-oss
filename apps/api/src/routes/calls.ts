@@ -5,7 +5,7 @@ import type { Db } from "../db.js";
 import { lifecycle, type Deps } from "../deps.js";
 import { ApiError, notFound } from "../errors.js";
 import { toCall } from "../serialize.js";
-import { markEnded, markStarted, reapStaleCalls } from "../services/calls.js";
+import { endAfterStopGrace, markEnded, markStarted, reapStaleCalls, type LifecycleDeps } from "../services/calls.js";
 import { getAgentRow, getVersionRow } from "./agents.js";
 
 const vars = z.record(z.string(), z.coerce.string()).default({});
@@ -17,7 +17,7 @@ const WebCall = z.object({
   dynamic_variables: vars,
   metadata: z.record(z.string(), z.unknown()).default({}),
 });
-const PhoneCall = WebCall.extend({ from_number: e164, to_number: e164 });
+const PhoneCall = WebCall.extend({ from_number: e164.optional(), to_number: e164 });
 const ListQuery = z.object({
   limit: z.coerce.number().int().min(1).max(200).default(50),
   pagination_key: z.string().optional(),
@@ -27,11 +27,12 @@ const ListQuery = z.object({
 
 type P = { Params: { callId: string } };
 
-async function reserveCall(db: Db, orgId: string, body: z.infer<typeof WebCall>, extra: { call_type: string; direction: string | null; from: string | null; to: string | null }) {
+async function reserveCall(lc: LifecycleDeps, orgId: string, body: z.infer<typeof WebCall>, extra: { call_type: string; direction: string | null; from: string | null; to: string | null }) {
+  const { db } = lc;
   const agent = await getAgentRow(db, orgId, body.agent_id);
   const version = body.agent_version ?? agent.published_version ?? agent.latest_version;
   await getVersionRow(db, agent.id, version); // 404 if it doesn't exist
-  await reapStaleCalls(db, orgId);
+  await reapStaleCalls(lc, orgId);
 
   const callId = newId("call");
   await db.tx(async (t) => {
@@ -69,7 +70,7 @@ export function callRoutes(app: FastifyInstance, d: Deps) {
     if (!voice.configured) throw new ApiError(503, "voice_not_configured", "LiveKit is not configured on the server (set LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET)");
     const body = WebCall.parse(req.body);
     const orgId = req.auth!.orgId;
-    const { callId } = await reserveCall(db, orgId, body, { call_type: "web_call", direction: null, from: null, to: null });
+    const { callId } = await reserveCall(lifecycle(d), orgId, body, { call_type: "web_call", direction: null, from: null, to: null });
     try {
       const { accessToken, livekitUrl } = await voice.startWebCall(callId);
       return reply.status(201).send({ call_id: callId, access_token: accessToken, livekit_url: livekitUrl, call: toCall(await getCallRow(db, orgId, callId)) });
@@ -82,11 +83,16 @@ export function callRoutes(app: FastifyInstance, d: Deps) {
 
   app.post("/v1/calls/phone", async (req, reply) => {
     if (!voice.sipConfigured) throw new ApiError(501, "not_configured", "Phone calls need LIVEKIT_SIP_OUTBOUND_TRUNK_ID (a LiveKit outbound SIP trunk)");
+    const allowed = d.env.sipFromNumbers;
+    if (!allowed.length) throw new ApiError(501, "not_configured", "Phone calls need SIP_FROM_NUMBERS (the caller IDs your SIP trunk owns)");
     const body = PhoneCall.parse(req.body);
+    // Only caller IDs the operator owns: stops tenants from spoofing arbitrary numbers through the shared trunk.
+    const fromNumber = body.from_number ?? allowed[0]!;
+    if (!allowed.includes(fromNumber)) throw new ApiError(400, "from_number_not_allowed", `from_number must be one of: ${allowed.join(", ")}`);
     const orgId = req.auth!.orgId;
-    const { callId } = await reserveCall(db, orgId, body, { call_type: "phone_call", direction: "outbound", from: body.from_number, to: body.to_number });
+    const { callId } = await reserveCall(lifecycle(d), orgId, body, { call_type: "phone_call", direction: "outbound", from: fromNumber, to: body.to_number });
     try {
-      await voice.startPhoneCall(callId, body.from_number, body.to_number);
+      await voice.startPhoneCall(callId, fromNumber, body.to_number);
       return reply.status(201).send({ call_id: callId, call: toCall(await getCallRow(db, orgId, callId)) });
     } catch (e) {
       req.log.error(e, "placing phone call failed");
@@ -98,7 +104,7 @@ export function callRoutes(app: FastifyInstance, d: Deps) {
   app.get("/v1/calls", async (req) => {
     const q = ListQuery.parse(req.query);
     const orgId = req.auth!.orgId;
-    await reapStaleCalls(db, orgId);
+    await reapStaleCalls(lifecycle(d), orgId);
     const params: unknown[] = [orgId];
     let where = `c.org_id = $1`;
     if (q.pagination_key) where += ` and c.id < $${params.push(q.pagination_key)}`;
@@ -119,9 +125,12 @@ export function callRoutes(app: FastifyInstance, d: Deps) {
     const row = await getCallRow(db, req.auth!.orgId, req.params.callId);
     if (row.status !== "registered" && row.status !== "ongoing") throw new ApiError(409, "call_not_active", "Call is not active");
     if (voice.configured) await voice.endCall(row.id);
-    // The worker reports `manual_stopped`; if no worker ever joined, close it here.
+    // The worker reports `manual_stopped`. If no worker ever joined, close it now; if one did, give it
+    // a grace period and then close it ourselves (the worker may have died). A late worker report still wins.
     if (row.status === "registered") {
-      await markEnded(lifecycle(d), row.id, CallEndedReport.parse({ ended_at: Date.now(), disconnection_reason: "manual_stopped" }));
+      await markEnded(lifecycle(d), row.id, CallEndedReport.parse({ ended_at: Date.now(), disconnection_reason: "manual_stopped" }), { fallback: true });
+    } else {
+      d.background(endAfterStopGrace(lifecycle(d), row.id, d.stopGraceMs ?? 15_000));
     }
     return { ok: true };
   });

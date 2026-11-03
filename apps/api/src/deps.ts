@@ -13,6 +13,8 @@ export type Deps = {
   webhooks: WebhookOptions;
   /** Fire-and-forget work (webhooks, analysis). Tests await it via `drain()`. */
   background: (p: Promise<unknown>) => void;
+  /** How long a manual stop waits for the worker's report before closing the call itself. Default 15 s. */
+  stopGraceMs?: number;
 };
 
 export const lifecycle = (d: Deps): LifecycleDeps => ({ db: d.db, analyzer: d.analyzer, webhooks: d.webhooks, background: d.background });

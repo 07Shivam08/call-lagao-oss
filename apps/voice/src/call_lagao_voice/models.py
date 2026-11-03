@@ -219,6 +219,8 @@ class CallStartedReport(_Model):
 
 class CallEndedReport(_Model):
     ended_at: int  # epoch ms
+    # When the caller joined/answered; lets the API recover if `started` was lost.
+    started_at: int | None = None
     disconnection_reason: DisconnectionReason
     transcript: list[TranscriptItem] = Field(default_factory=list)
     collected_variables: dict[str, str] = Field(default_factory=dict)

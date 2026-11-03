@@ -147,6 +147,7 @@ export const api = {
 
   org: {
     update: (body: { name?: string; webhook_url?: string | null }) => request<Org>("PATCH", "/org", body),
+    getWebhookSecret: () => request<{ webhook_secret: string }>("GET", "/org/webhook-secret"),
     rotateWebhookSecret: () => request<{ webhook_secret: string }>("POST", "/org/webhook-secret", {}),
   },
 

@@ -208,6 +208,7 @@ All services read the repo-root `.env`. Real environment variables always take p
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | for calls | – | LiveKit project keys, used for agent dispatch and browser tokens. |
 | `LIVEKIT_AGENT_NAME` | no | `call-lagao-agent` | Name the worker registers under. Must match on both sides. |
 | `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` | for phone | – | LiveKit outbound SIP trunk id (`ST_…`). Phone calls return `501` without it. |
+| `SIP_FROM_NUMBERS` | for phone | – | Comma-separated caller IDs (E.164) your trunk owns, e.g. `+14155550100,+14155550101`. Calls may only use these as `from_number`, and the first is the default, so tenants can't spoof caller ID. Phone calls return `501` without it. |
 | `OPENAI_API_KEY` | no | – | Enables post-call analysis. Without it, analysis is skipped. |
 
 ### Voice worker (`apps/voice`)
@@ -326,17 +327,17 @@ Call `startCall` from a click handler so the browser allows the microphone and a
 Outbound calls go through LiveKit SIP. You bring your own carrier.
 
 1. Create an Elastic SIP trunk at [Twilio](https://www.twilio.com/docs/sip-trunking) or [Telnyx](https://developers.telnyx.com/docs/voice/sip-trunking), and buy or port a number on it.
-2. Register it as a [LiveKit outbound trunk](https://docs.livekit.io/sip/trunk-outbound/) and set `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` in `.env`.
+2. Register it as a [LiveKit outbound trunk](https://docs.livekit.io/sip/trunk-outbound/). In `.env`, set `LIVEKIT_SIP_OUTBOUND_TRUNK_ID` and set `SIP_FROM_NUMBERS` to the number(s) you own on that trunk.
 3. Place a call:
 
 ```bash
 curl -s $CL/v1/calls/phone -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" -d '{
-  "agent_id": "agent_XXXX", "from_number": "+14155550100", "to_number": "+14155550123",
+  "agent_id": "agent_XXXX", "to_number": "+14155550123",
   "dynamic_variables": { "customer_name": "Asha" }
 }'
 ```
 
-The call counts as *started* only when the callee answers. Unanswered calls end with `dial_no_answer`, `dial_busy` or `dial_failed`.
+`from_number` is optional and defaults to the first `SIP_FROM_NUMBERS` entry. Any other caller ID is rejected with `400 from_number_not_allowed`. The call counts as *started* only when the callee answers. Unanswered calls end with `dial_no_answer`, `dial_busy` or `dial_failed`.
 
 ### 5. Webhooks
 
@@ -346,7 +347,7 @@ Set an org-wide URL in **Settings** and/or a per-agent `webhook_url`. Each event
 x-call-lagao-signature: v=<epoch ms>,d=<hex HMAC-SHA256(webhook_secret, raw_body + epoch_ms)>
 ```
 
-Deliveries are retried 3 times (0 s, 2 s, 8 s) with a 10 s timeout. Redirects are not followed, and URLs that resolve to private addresses are refused unless `ALLOW_PRIVATE_URLS=true` (for testing against `localhost`, use that flag or a tunnel such as ngrok). **Always verify the signature** against the raw request body, using the secret from **Settings → Rotate webhook secret**:
+Deliveries are retried 3 times (0 s, 2 s, 8 s) with a 10 s timeout. Redirects are not followed, and URLs that resolve to private addresses are refused unless `ALLOW_PRIVATE_URLS=true` (for testing against `localhost`, use that flag or a tunnel such as ngrok). **Always verify the signature** against the raw request body, using the secret from **Settings → Show webhook secret** (or `GET /v1/org/webhook-secret`):
 
 ```ts
 import { createHmac, timingSafeEqual } from "node:crypto";
@@ -359,6 +360,8 @@ export function verifyCallLagao(rawBody: string, header: string, secret: string)
   return expected.length === given.length && timingSafeEqual(expected, given);
 }
 ```
+
+If a voice worker dies mid-call, the API closes the call itself (15 s after a stop, or through a safety net for stale calls). If the worker's real report arrives later, it replaces that result and `call_ended` / `call_analyzed` are sent again. Treat the latest event for a `call_id` as authoritative.
 
 The same helper ships as `verifyWebhook` in `@call-lagao/shared/webhook`.
 

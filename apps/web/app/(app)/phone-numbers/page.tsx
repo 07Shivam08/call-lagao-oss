@@ -14,12 +14,12 @@ const steps = [
   {
     icon: Waypoints,
     title: "Connect it to LiveKit",
-    body: "Register the trunk as a LiveKit outbound trunk and set LIVEKIT_SIP_OUTBOUND_TRUNK_ID in the API's .env.",
+    body: "Register the trunk as a LiveKit outbound trunk and set LIVEKIT_SIP_OUTBOUND_TRUNK_ID and SIP_FROM_NUMBERS (the caller IDs you own on that trunk) in the API's .env.",
   },
   {
     icon: PhoneOutgoing,
     title: "Place calls via the API",
-    body: "POST /v1/calls/phone with agent_id, from_number and to_number. The API creates the LiveKit room, dispatches your agent and dials the callee as participant phone_user.",
+    body: "POST /v1/calls/phone with agent_id and to_number (from_number is optional and must be one of SIP_FROM_NUMBERS). The API creates the LiveKit room, dispatches your agent and dials the callee as participant phone_user.",
   },
 ];
 

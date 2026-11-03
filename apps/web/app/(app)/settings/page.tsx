@@ -27,6 +27,7 @@ function OrgCard() {
   const [name, setName] = useState(org.name);
   const [webhook, setWebhook] = useState(org.webhook_url ?? "");
   const [secret, setSecret] = useState<string | null>(null);
+  const [secretTitle, setSecretTitle] = useState("Webhook secret");
   const [confirmRotate, setConfirmRotate] = useState(false);
 
   useEffect(() => {
@@ -44,6 +45,15 @@ function OrgCard() {
     mutationFn: api.org.rotateWebhookSecret,
     onSuccess: (r) => {
       setConfirmRotate(false);
+      setSecretTitle("New webhook secret");
+      setSecret(r.webhook_secret);
+    },
+  });
+
+  const reveal = useMutation({
+    mutationFn: api.org.getWebhookSecret,
+    onSuccess: (r) => {
+      setSecretTitle("Webhook secret");
       setSecret(r.webhook_secret);
     },
   });
@@ -68,10 +78,16 @@ function OrgCard() {
           <Input value={webhook} onChange={(e) => setWebhook(e.target.value)} placeholder="https://example.com/webhooks/call-lagao" type="url" />
         </Field>
         {save.error && <Alert>{save.error.message}</Alert>}
+        {reveal.error && <Alert>{reveal.error.message}</Alert>}
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <Button type="button" onClick={() => (rotate.reset(), setConfirmRotate(true))}>
-            <RotateCw className="size-4" /> Rotate webhook secret
-          </Button>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button type="button" loading={reveal.isPending} onClick={() => reveal.mutate()}>
+              <KeyRound className="size-4" /> Show webhook secret
+            </Button>
+            <Button type="button" onClick={() => (rotate.reset(), setConfirmRotate(true))}>
+              <RotateCw className="size-4" /> Rotate webhook secret
+            </Button>
+          </div>
           <div className="flex items-center gap-3">
             {save.isSuccess && !dirty && <span className="text-xs text-emerald-300">Saved</span>}
             <Button type="submit" variant="primary" disabled={!dirty || !name.trim()} loading={save.isPending}>
@@ -100,7 +116,7 @@ function OrgCard() {
         <p className="text-sm text-muted">The current secret stops working immediately. Update your webhook verifier with the new one.</p>
         {rotate.error && <Alert className="mt-3">{rotate.error.message}</Alert>}
       </Modal>
-      <Modal open={!!secret} onClose={() => setSecret(null)} title="New webhook secret" footer={<Button onClick={() => setSecret(null)}>Done</Button>}>
+      <Modal open={!!secret} onClose={() => setSecret(null)} title={secretTitle} footer={<Button onClick={() => setSecret(null)}>Done</Button>}>
         {secret && <SecretReveal value={secret} />}
       </Modal>
     </Card>

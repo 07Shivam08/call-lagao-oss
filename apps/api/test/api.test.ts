@@ -22,6 +22,7 @@ const env: Env = {
   allowPrivateUrls: false,
   livekit: { url: "wss://fake.livekit", apiKey: "k", apiSecret: "s", agentName: "call-lagao-agent", sipOutboundTrunkId: "" },
   openaiApiKey: "",
+  sipFromNumbers: [],
 };
 
 const voiceCalls: string[] = [];
@@ -80,6 +81,7 @@ beforeAll(async () => {
       },
     },
     background: (p) => pending.push(p),
+    stopGraceMs: 0,
   });
 });
 
@@ -334,5 +336,118 @@ describe("security", () => {
     await expect(assertPublicUrl("http://169.254.169.254/latest/meta-data")).rejects.toThrow();
     await expect(assertPublicUrl("http://localhost:8080/hook")).rejects.toThrow();
     await expect(assertPublicUrl("file:///etc/passwd")).rejects.toThrow();
+  });
+});
+
+describe("fallback lifecycle", () => {
+  const phoneCalls: string[] = [];
+  let app3: FastifyInstance;
+  let db3: Db;
+  let ck = "";
+  let agent3 = "";
+  const hooks: Delivery[] = [];
+  let bg: Promise<unknown>[] = [];
+  const settle = async () => {
+    while (bg.length) {
+      const b = bg;
+      bg = [];
+      await Promise.allSettled(b);
+    }
+  };
+  const req = (method: string, url: string, payload?: unknown) => app3.inject({ method: method as any, url, payload: payload as any, headers: { cookie: ck } });
+  const worker = (callId: string, what: "started" | "ended", payload: unknown) =>
+    app3.inject({ method: "POST", url: `/internal/calls/${callId}/${what}`, headers: { "x-internal-secret": SECRET }, payload: payload as any });
+  const newCall = async () => (await req("POST", "/v1/calls/web", { agent_id: agent3 })).json().call_id as string;
+  const events = (callId: string) => hooks.filter((h) => h.body.call.call_id === callId).map((h) => h.body.event);
+
+  beforeAll(async () => {
+    db3 = await openDb("", "memory");
+    app3 = await buildApp({
+      db: db3,
+      env: { ...env, sipFromNumbers: ["+14155550100", "+14155550101"] },
+      voice: {
+        ...fakeVoice,
+        sipConfigured: true,
+        async startPhoneCall(callId, from, to) {
+          phoneCalls.push(`${callId}:${from}->${to}`);
+        },
+      },
+      analyzer: fakeAnalyzer,
+      webhooks: {
+        backoffMs: [0],
+        fetch: async (url, init) => {
+          hooks.push({ url, body: JSON.parse(init.body), signature: init.headers[SIGNATURE_HEADER]! });
+          return { status: 200 };
+        },
+      },
+      background: (p) => bg.push(p),
+      stopGraceMs: 0,
+    });
+    const s = await app3.inject({ method: "POST", url: "/v1/auth/signup", payload: { email: "fb@example.com", password: "password123" } });
+    ck = String(s.headers["set-cookie"]).split(";")[0]!;
+    await req("PATCH", "/v1/org", { webhook_url: "https://hooks.example.com/cl" });
+    agent3 = (await req("POST", "/v1/agents", { name: "FB" })).json().agent_id;
+  });
+  afterAll(async () => {
+    await app3.close();
+    await db3.close();
+  });
+
+  it("closes a stopped call whose worker never reports, and lets a late report replace it", async () => {
+    const id = await newCall();
+    await worker(id, "started", { started_at: Date.now() - 5000 });
+    expect((await req("POST", `/v1/calls/${id}/stop`)).statusCode).toBe(200);
+    await settle();
+    let c = (await req("GET", `/v1/calls/${id}`)).json();
+    expect(c.call_status).toBe("ended");
+    expect(c.disconnection_reason).toBe("manual_stopped");
+    expect(events(id)).toEqual(["call_started", "call_ended"]); // empty transcript → no analysis
+
+    const late = { ended_at: Date.now(), disconnection_reason: "manual_stopped", transcript: [{ role: "agent", content: "Hello" }] };
+    expect((await worker(id, "ended", late)).json().applied).toBe(true);
+    expect((await worker(id, "ended", late)).json().applied).toBe(false); // still idempotent
+    await settle();
+    c = (await req("GET", `/v1/calls/${id}`)).json();
+    expect(c.transcript).toHaveLength(1);
+    expect(events(id)).toEqual(["call_started", "call_ended", "call_ended", "call_analyzed"]);
+  });
+
+  it("recovers the start time from the ended report when `started` was lost", async () => {
+    const id = await newCall();
+    const startedAt = Date.now() - 42_000;
+    await worker(id, "ended", { ended_at: startedAt + 42_000, started_at: startedAt, disconnection_reason: "user_hangup", transcript: [{ role: "user", content: "hi" }] });
+    await settle();
+    const c = (await req("GET", `/v1/calls/${id}`)).json();
+    expect(c.call_status).toBe("ended");
+    expect(c.duration_ms).toBe(42_000);
+    expect(c.start_timestamp).toBe(startedAt);
+  });
+
+  it("reaps stale calls through the normal lifecycle, so call_ended webhooks fire", async () => {
+    const id = await newCall();
+    await db3.query(`update calls set created_at = now() - interval '10 minutes' where id = $1`, [id]);
+    await req("GET", "/v1/calls");
+    await settle();
+    const c = (await req("GET", `/v1/calls/${id}`)).json();
+    expect(c.call_status).toBe("not_connected");
+    expect(c.disconnection_reason).toBe("error_worker");
+    expect(events(id)).toEqual(["call_ended"]);
+  });
+
+  it("shows the current webhook secret", async () => {
+    const shown = (await req("GET", "/v1/org/webhook-secret")).json().webhook_secret;
+    expect(shown).toMatch(/^whsec_/);
+    const rotated = (await req("POST", "/v1/org/webhook-secret", {})).json().webhook_secret;
+    expect((await req("GET", "/v1/org/webhook-secret")).json().webhook_secret).toBe(rotated);
+    expect(rotated).not.toBe(shown);
+  });
+
+  it("only dials from caller IDs listed in SIP_FROM_NUMBERS", async () => {
+    const bad = await req("POST", "/v1/calls/phone", { agent_id: agent3, from_number: "+19998887777", to_number: "+14155550123" });
+    expect(bad.statusCode).toBe(400);
+    expect(bad.json().error.code).toBe("from_number_not_allowed");
+    const ok = await req("POST", "/v1/calls/phone", { agent_id: agent3, to_number: "+14155550123" });
+    expect(ok.statusCode).toBe(201);
+    expect(phoneCalls.at(-1)).toBe(`${ok.json().call_id}:+14155550100->+14155550123`);
   });
 });
